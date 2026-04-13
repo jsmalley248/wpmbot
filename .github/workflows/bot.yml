@@ -1,0 +1,39 @@
+name: Weather Bot
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 minutes
+  workflow_dispatch:           # allow manual "Run workflow" trigger in the Actions tab
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Restore DB cache
+        uses: actions/cache@v4
+        with:
+          path: weather_bot.db
+          key: weather-bot-db-${{ github.run_id }}
+          restore-keys: |
+            weather-bot-db-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          KALSHI_API_KEY:      ${{ secrets.KALSHI_API_KEY }}
+          GMAIL_ADDRESS:       ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          EMAIL_TO:            ${{ secrets.EMAIL_TO }}
+        run: python bot.py --auto-trade

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cmd /c \"py --version\")",
+      "Bash(cmd /c \"where py\")",
+      "Read(//c/Users/jacob/AppData/Local/Programs/**)",
+      "Read(//c//**)",
+      "Bash(\"/c/Users/jacob/AppData/Local/Microsoft/WindowsApps/python.exe\" --version)"
+    ]
+  }
+}
