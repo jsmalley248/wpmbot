@@ -2,7 +2,7 @@ name: Weather Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # every 15 minutes
+    - cron: '*/10 * * * *'   # every 10 minutes
   workflow_dispatch:           # allow manual "Run workflow" trigger in the Actions tab
 
 jobs:
