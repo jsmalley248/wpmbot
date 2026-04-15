@@ -43,7 +43,8 @@ console = Console()
 KALSHI_BASE    = "https://api.elections.kalshi.com/trade-api/v2"
 NWS_BASE       = "https://api.weather.gov"
 DB_PATH        = "weather_bot.db"
-EDGE_THRESHOLD = 5.0   # minimum % edge to trigger an alert
+EDGE_THRESHOLD      = 3.5   # minimum % edge to trigger an alert
+NEAR_MISS_THRESHOLD = 1.5   # show in diagnostic table but don't alert
 KALSHI_API_KEY = os.getenv("KALSHI_API_KEY", "")
 AUTO_TRADE     = False  # set to True via --auto-trade CLI flag
 
@@ -213,6 +214,20 @@ def has_open_paper_trade(ticker: str) -> bool:
             (ticker,),
         ).fetchone()
     return row is not None
+
+
+def recently_alerted(ticker: str, price_cents: float, tolerance: int = 3) -> bool:
+    """Return True if we already fired an alert for this ticker today at a similar price.
+    Allows re-alerting if the market has moved more than `tolerance` cents."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as con:
+        row = con.execute(
+            "SELECT market_price FROM alerts WHERE ticker=? AND date=? ORDER BY ts DESC LIMIT 1",
+            (ticker, today),
+        ).fetchone()
+    if row is None:
+        return False
+    return abs(row[0] - price_cents) <= tolerance
 
 
 def resolve_paper_trade(ticker: str, outcome: str):
@@ -439,26 +454,31 @@ def extract_threshold(subtitle: str) -> Optional[tuple[float, bool]]:
     return (float(nums[0]), above)
 
 
-def best_side(blended_prob: float, market_price_cents: float) -> tuple[str, float]:
-    """Return the better side to trade and its edge in percentage points."""
-    yes_edge = (blended_prob - market_price_cents / 100) * 100
-    no_edge  = ((1 - blended_prob) - (1 - market_price_cents / 100)) * 100
+def best_side(blended_prob: float, yes_ask: float, no_ask: float) -> tuple[str, float]:
+    """Return the better side to trade and its edge using actual entry prices (ask side).
+    yes_ask: cost in cents to buy YES (e.g. 58)
+    no_ask:  cost in cents to buy NO  (= 100 - yes_bid)
+    Edge reflects real P&L after paying the spread."""
+    yes_edge = (blended_prob - yes_ask / 100) * 100
+    no_edge  = ((1 - blended_prob) - no_ask / 100) * 100
     if yes_edge >= no_edge:
         return "YES", round(yes_edge, 2)
     return "NO", round(no_edge, 2)
 
 # ─── Main Scan ────────────────────────────────────────────────────────────────
 
-def scan_city(city: dict) -> list[dict]:
+def scan_city(city: dict) -> tuple[list[dict], list[dict]]:
+    """Returns (alerts, near_misses). Alerts fire emails/paper trades; near-misses are diagnostic only."""
     if "nws_office" not in city:
-        return []   # grid resolution failed at startup
+        return [], []   # grid resolution failed at startup
 
     markets_raw = fetch_kalshi_markets(city["series"])
     if not markets_raw:
-        return []
+        return [], []
 
     nws_periods = fetch_nws_hourly(city["nws_office"], city["grid_x"], city["grid_y"])
     alerts      = []
+    near_misses = []
 
     for raw in markets_raw:
         m = parse_market(raw)
@@ -483,32 +503,39 @@ def scan_city(city: dict) -> list[dict]:
         w         = nws_weight(m["close_time"])
         blended   = round(w * nws_prob + (1 - w) * base_rate, 4)
 
-        side, edge = best_side(blended, m["mid_yes"])
+        # Use actual entry prices (ask side) so edge reflects real-world fills
+        no_ask         = 100 - m["yes_bid"]
+        side, edge     = best_side(blended, m["yes_ask"], no_ask)
+        entry_price    = m["yes_ask"] if side == "YES" else no_ask
 
-        if edge >= EDGE_THRESHOLD and m["volume"] >= 10:
-            alert = {
-                "ticker":       m["ticker"],
-                "city":         city["name"],
-                "question":     f"{city['name']} high temp {m['subtitle']}?",
-                "side":         side,
-                "market_price": m["mid_yes"],
-                "nws_prob":     round(nws_prob * 100, 1),
-                "base_rate":    round(base_rate * 100, 1),
-                "blended_prob": round(blended * 100, 1),
-                "edge":         edge,
-                "volume":       m["volume"],
-                "horizon":      m["close_time"][:10] if m["close_time"] else "?",
-                "yes_bid":      m["yes_bid"],
-                "yes_ask":      m["yes_ask"],
-            }
-            alerts.append(alert)
-            log_alert(alert)
-            if AUTO_TRADE and not has_open_paper_trade(alert["ticker"]):
-                entry = alert["yes_ask"] if alert["side"] == "YES" else (100 - alert["yes_bid"])
-                log_paper_trade(alert["ticker"], alert["city"], alert["side"],
-                                entry, alert["blended_prob"], alert["edge"])
+        record = {
+            "ticker":       m["ticker"],
+            "city":         city["name"],
+            "question":     f"{city['name']} high temp {m['subtitle']}?",
+            "side":         side,
+            "market_price": entry_price,
+            "nws_prob":     round(nws_prob * 100, 1),
+            "base_rate":    round(base_rate * 100, 1),
+            "blended_prob": round(blended * 100, 1),
+            "edge":         edge,
+            "volume":       m["volume"],
+            "horizon":      m["close_time"][:10] if m["close_time"] else "?",
+            "yes_bid":      m["yes_bid"],
+            "yes_ask":      m["yes_ask"],
+        }
 
-    return alerts
+        if edge >= EDGE_THRESHOLD and m["volume"] >= 5:
+            if recently_alerted(m["ticker"], entry_price):
+                continue   # same market, same price — suppress duplicate
+            alerts.append(record)
+            log_alert(record)
+            if AUTO_TRADE and not has_open_paper_trade(record["ticker"]):
+                log_paper_trade(record["ticker"], record["city"], record["side"],
+                                entry_price, record["blended_prob"], record["edge"])
+        elif edge >= NEAR_MISS_THRESHOLD and m["volume"] >= 5:
+            near_misses.append(record)
+
+    return alerts, near_misses
 
 
 def send_email_alert(alerts: list):
@@ -537,33 +564,18 @@ def send_email_alert(alerts: list):
         console.print(f"[red]Email failed: {e}[/red]")
 
 
-def run_scan():
-    console.rule("[bold]Weather Bot Scan[/bold]")
-    console.print(f"[dim]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/dim]\n")
-
-    all_alerts = []
-    for city in CITIES:
-        console.print(f"[dim]Scanning {city['name']}...[/dim]")
-        all_alerts.extend(scan_city(city))
-
-    if not all_alerts:
-        console.print("[yellow]No alerts above threshold.[/yellow]")
-        return
-
-    all_alerts.sort(key=lambda a: a["edge"], reverse=True)
-
-    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold")
+def _build_alert_table(rows: list[dict], header_style: str = "bold") -> Table:
+    table = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style=header_style)
     table.add_column("City",      style="cyan",  min_width=12)
     table.add_column("Market",    style="white", min_width=16)
     table.add_column("Side",      style="bold",  min_width=5)
-    table.add_column("Mkt price", justify="right", min_width=9)
+    table.add_column("Entry",     justify="right", min_width=7)
     table.add_column("NWS prob",  justify="right", min_width=9)
     table.add_column("Base rate", justify="right", min_width=10)
     table.add_column("Blended",   justify="right", min_width=9)
-    table.add_column("Edge",      justify="right", style="green", min_width=7)
+    table.add_column("Edge",      justify="right", min_width=7)
     table.add_column("Volume",    justify="right", min_width=7)
-
-    for a in all_alerts:
+    for a in rows:
         side_color = "green" if a["side"] == "YES" else "red"
         table.add_row(
             a["city"], a["ticker"],
@@ -575,10 +587,37 @@ def run_scan():
             f"+{a['edge']}%",
             str(a["volume"]),
         )
+    return table
 
-    console.print(table)
-    console.print(f"\n[bold]{len(all_alerts)}[/bold] alert(s) logged to [cyan]{DB_PATH}[/cyan]")
-    send_email_alert(all_alerts)
+
+def run_scan():
+    console.rule("[bold]Weather Bot Scan[/bold]")
+    console.print(f"[dim]{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/dim]\n")
+
+    all_alerts     = []
+    all_near_misses = []
+    for city in CITIES:
+        console.print(f"[dim]Scanning {city['name']}...[/dim]")
+        alerts, near_misses = scan_city(city)
+        all_alerts.extend(alerts)
+        all_near_misses.extend(near_misses)
+
+    all_alerts.sort(key=lambda a: a["edge"], reverse=True)
+    all_near_misses.sort(key=lambda a: a["edge"], reverse=True)
+
+    if all_alerts:
+        console.print(f"\n[bold green]ALERTS ({len(all_alerts)})[/bold green]")
+        console.print(_build_alert_table(all_alerts))
+        console.print(f"[bold]{len(all_alerts)}[/bold] alert(s) logged to [cyan]{DB_PATH}[/cyan]")
+        send_email_alert(all_alerts)
+    else:
+        console.print("[yellow]No alerts above threshold.[/yellow]")
+
+    if all_near_misses:
+        console.print(f"\n[dim]NEAR MISSES — edge {NEAR_MISS_THRESHOLD}%–{EDGE_THRESHOLD}% (diagnostic only, no trade)[/dim]")
+        console.print(_build_alert_table(all_near_misses, header_style="dim"))
+    elif not all_alerts:
+        console.print("[dim]No near-miss opportunities either (edge < 1.5% everywhere).[/dim]")
 
 # ─── Paper Trading Summary ────────────────────────────────────────────────────
 
